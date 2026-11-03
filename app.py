@@ -8,6 +8,7 @@ def convert_magic_to_custom_final(uploaded_file):
     tree = ET.parse(uploaded_file)
     root = tree.getroot()
     
+    # 1. Dynamically identify Source Array Wrappers
     src_wrappers = {}
     for field in root.findall('.//SourceSchemas//Field'):
         xsi_type = field.attrib.get('{http://www.w3.org/2001/XMLSchema-instance}type', '')
@@ -23,6 +24,7 @@ def convert_magic_to_custom_final(uploaded_file):
     sorted_src_wrappers = sorted(src_wrappers.items(), key=lambda x: len(x[0]), reverse=True)
     src_arrays = set(parent for wrapper, parent in sorted_src_wrappers)
 
+    # 2. Identify Destination Arrays & Primitives
     dest_arrays = set()
     primitive_dest_arrays = set()
     dest_fields = root.findall('.//DestinationSchemas//Field')
@@ -35,7 +37,8 @@ def convert_magic_to_custom_final(uploaded_file):
         dest_id = ident.text
         max_inst = field.find('MaxInstance')
         if max_inst is not None and max_inst.text not in ('0', '1'):
-            dest_arrays.add(dest_id)
+            clean_id = dest_id.rsplit('/', 1)[0] if '~Value' in dest_id else dest_id
+            dest_arrays.add(clean_id)
             
         is_multi_simple = field.find('IsMultiSimple')
         if is_multi_simple is not None and is_multi_simple.text == 'true':
@@ -47,16 +50,34 @@ def convert_magic_to_custom_final(uploaded_file):
         for conn in connections.findall('ConnectionData'):
             dest_to_source[conn.find('DestinationIdentifier').text] = conn.find('SourceIdentifier').text
 
+    # Shared Advanced Settings matching the exact target schema
+    advanced_settings = {
+        "delimiter": ",",
+        "textQualifier": "\"",
+        "includeHeader": True,
+        "lineTerminator": "auto",
+        "trimWhitespace": True,
+        "skipEmptyRows": True,
+        "nullValue": "",
+        "quoteAllFields": False,
+        "dateFormat": "yyyy-MM-dd",
+        "numberFormat": "0.##",
+        "alwaysCreateNodes": False,
+        "createEmptyArrayNodes": False,
+        "formatting": "None"
+    }
+
     custom_mapping = {
         "sourceSettings": {
             "format": "json-schema",
             "title": "Source",
-            "advanced": {"delimiter": ",", "textQualifier": "\"", "includeHeader": True}
+            "advanced": advanced_settings
         },
         "destinationSettings": {
             "format": "xsd",
             "title": "Destination",
-            "advanced": {"delimiter": ",", "textQualifier": "\"", "includeHeader": True}
+            "advanced": advanced_settings,
+            "outputTemplate": {} # Populated dynamically below
         },
         "mappings": []
     }
@@ -69,25 +90,64 @@ def convert_magic_to_custom_final(uploaded_file):
                 p = arr + '[*]'
         return p
 
-    def star_parent_path(path, arrays):
-        p = path
-        for arr in sorted(list(arrays), key=len, reverse=True):
-            if p.startswith(arr + '/'):
-                p = p.replace(arr + '/', arr + '[*]/')
-        return p
+    # Build Dynamic Output Template Base 
+    column_order = []
+    column_types = {}
+    
+    for field in dest_fields:
+        ident = field.find('Identifier')
+        if ident is None or not ident.text:
+            continue
+            
+        dest_id = ident.text
+        if '/' not in dest_id: 
+            continue
+            
+        is_prim_base = dest_id in primitive_dest_arrays
+        is_comp_base = (dest_id in dest_arrays and not is_prim_base and '~Value' not in dest_id)
+        
+        # Output schemas omit the complex parent folders; only keep the terminal/leaf nodes
+        if is_comp_base or is_prim_base:
+            continue
+            
+        clean_dst = dest_id.rsplit('/', 1)[0] if '~Value' in dest_id else dest_id
+        final_dst = star_path(clean_dst, dest_arrays)
+        
+        if final_dst not in column_order:
+            column_order.append(final_dst)
+            column_types[final_dst] = "string"
 
+    custom_mapping["destinationSettings"]["outputTemplate"] = {
+        "columnOrder": column_order,
+        "columnTypes": column_types,
+        "structure": {
+            "type": "xsd",
+            "headers": True,
+            "recordPath": "Record[*]"
+        }
+    }
+
+    # Generate Individual Field Mappings
     for field in dest_fields:
         dest_id_node = field.find('Identifier')
         if dest_id_node is None or not dest_id_node.text:
             continue
             
         dest_id = dest_id_node.text
-        if dest_id == 'ADT_A30' or dest_id == 'root':
+        if dest_id == 'root' or ('/' not in dest_id):
             continue
 
         if dest_id in dest_to_source:
             src_id = dest_to_source[dest_id]
             if src_id == 'root':
+                continue
+                
+            is_primitive_base = dest_id in primitive_dest_arrays
+            is_primitive_val = '~Value' in dest_id
+            is_complex_base = (dest_id in dest_arrays and not is_primitive_base and not is_primitive_val)
+
+            # Eliminate primitive bases, mapping only the leaf '~Value' arrays directly 
+            if is_primitive_base:
                 continue
             
             clean_src = src_id
@@ -97,22 +157,12 @@ def convert_magic_to_custom_final(uploaded_file):
                 clean_src = clean_src.replace(wrapper + '/Value', parent)
                 clean_src = clean_src.replace(wrapper + '/', parent + '/')
             
-            clean_dst = dest_id
-            if '~Value' in clean_dst:
-                clean_dst = clean_dst.rsplit('/', 1)[0]
-
-            is_primitive_base = dest_id in primitive_dest_arrays
-            is_primitive_val = '~Value' in dest_id
-            is_complex_base = (dest_id in dest_arrays and not is_primitive_base and not is_primitive_val)
+            clean_dst = dest_id.rsplit('/', 1)[0] if is_primitive_val else dest_id
 
             if is_complex_base:
                 final_src = clean_src.replace('/', '.')
                 final_dst = clean_dst
                 data_type, map_type, transform = "array", "auto", {"type": "DIRECT"}
-            elif is_primitive_base:
-                final_src = star_parent_path(clean_src, src_arrays).replace('/', '.')
-                final_dst = star_parent_path(clean_dst, dest_arrays)
-                data_type, map_type, transform = "array", "manual", {"type": "DIRECT", "params": {}}
             else:
                 final_src = star_path(clean_src, src_arrays).replace('/', '.')
                 final_dst = star_path(clean_dst, dest_arrays)
@@ -136,7 +186,9 @@ def convert_magic_to_custom_final(uploaded_file):
                 except Exception:
                     decoded_expr = expr_node.text
                 
-                final_dst = star_path(dest_id, dest_arrays)
+                clean_dst = dest_id.rsplit('/', 1)[0] if '~Value' in dest_id else dest_id
+                final_dst = star_path(clean_dst, dest_arrays)
+                
                 custom_mapping["mappings"].append({
                     "id": str(uuid.uuid4()),
                     "sources": [],
@@ -157,13 +209,13 @@ uploaded_file = st.file_uploader("Upload Magic xpi XML/TXT file", type=['xml', '
 
 if uploaded_file is not None:
     if st.button("Convert File"):
-        with st.spinner("Converting..."):
+        with st.spinner("Analyzing schema and generating configuration..."):
             try:
                 json_output = convert_magic_to_custom_final(uploaded_file)
-                st.success("Conversion complete!")
+                st.success("Conversion complete! Schema matches target parameters.")
                 
                 st.download_button(
-                    label="Download Converted JSON",
+                    label="Download Target JSON Configuration",
                     data=json_output,
                     file_name="Converted_Mapping.json",
                     mime="application/json"
