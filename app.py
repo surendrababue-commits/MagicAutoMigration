@@ -223,7 +223,7 @@ def convert_magic_to_custom_final(uploaded_file):
 
 # UI Configuration
 st.set_page_config(page_title="Magic xpi to JSON Converter")
-st.title("Magic xpi to JSON Mapping Converter")
+st.title("Magic xpi to JSON Mapping Converter-2")
 st.markdown("Upload your Magic xpi mapping XML to automatically generate the new JSON schema.")
 
 uploaded_file = st.file_uploader("Upload Magic xpi XML/TXT file", type=['xml', 'txt'])
